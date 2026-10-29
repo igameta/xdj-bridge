@@ -1,0 +1,20 @@
+{
+  "mode": "virtual-device",
+  "backend": "native",
+  "interfaceName": "en6",
+  "profile": "auto",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "staleAfterMs": 3000,
+  "publicDeckIds": {
+    "169.254.95.63:11": "1",
+    "169.254.95.63:12": "2"
+  },
+  "osc": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 9000,
+    "maxHz": 20,
+    "snapshotIntervalMs": 1000
+  }
+}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XDJ · OSC</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+  <main>
+    <div class="receive-heading"><h2>受信情報 <span id="deck-count">0 デッキ</span></h2><div class="receive-actions"><div class="receive-status"><span id="session-status" class="session-status" data-state="disconnected">未接続</span><span id="demo-notice" class="mode-badge" hidden>デモデータ</span><span id="source-mode" class="mode-label"></span><span class="socket-connection"><i id="socket-dot" class="dot"></i><span id="socket-status">画面接続中</span></span></div><button id="settings-button" class="menu-button" type="button" aria-label="接続先とOSC出力の設定を開く" aria-controls="settings-drawer" aria-expanded="false" aria-haspopup="dialog"><span aria-hidden="true"><i></i><i></i><i></i></span></button></div></div>
+    <section id="decks" class="decks" aria-live="polite"><div class="empty-state"><p>デッキの状態を待っています。</p><span>メニューから接続先を設定してください。</span></div></section>
+    <details class="diagnostics-panel"><summary>診断 <span id="diagnostic-count">0 件</span></summary><section class="session-details" aria-label="接続状態"><dl class="session-detail-grid"><div><dt>現在の状態</dt><dd id="session-detail-state">未接続</dd></div><div><dt>インターフェース</dt><dd id="session-detail-interface">—</dd></div></dl><div class="session-message"><span class="session-message-label">直近の接続メッセージ（過去の記録）</span><p id="session-last-reason">記録はありません。</p></div></section><div id="diagnostics" class="diagnostics"><p class="subtle">診断情報はありません。</p></div></details>
+  </main>
+  <dialog id="settings-drawer" class="settings-drawer" aria-label="接続先とOSC出力の設定">
+    <div class="drawer-header"><button id="settings-close" class="drawer-close" type="button" aria-label="設定を閉じる" autofocus>×</button></div>
+    <div class="drawer-content">
+    <section class="settings-grid" aria-label="接続とOSCの設定">
+      <section class="settings-panel" aria-labelledby="connection-heading">
+        <div class="panel-heading"><h2 id="connection-heading">接続先</h2><span id="connection-status" class="status-text">設定を読み込み中</span></div>
+        <form id="connection-form">
+          <div class="connection-fields">
+            <label>機器<select id="device-select" name="profile"><option value="auto">自動検出</option><option value="xdj-rx3">XDJ-RX3</option><option value="xdj-az">XDJ-AZ</option><option value="generic-prolink">その他のPro DJ Link機器</option></select></label>
+            <label>ネットワークインターフェース<select id="interface-select" name="interfaceName"><option value="">選択してください</option></select></label>
+          </div>
+          <div class="connection-actions"><label>接続方法<select id="method-select"><option value="virtual-device">仮想参加</option><option value="passive">受信のみ</option><option value="pcap">pcap受信</option></select></label><button id="connect-button" class="primary" type="submit" disabled>接続</button><button id="disconnect-button" type="button" disabled>切断</button></div>
+          <p id="connection-error" class="form-message error" role="alert" hidden></p>
+          <p id="connection-hint" class="form-message">機器とインターフェースを選んで接続してください。</p>
+        </form>
+      </section>
+      <section class="settings-panel" aria-labelledby="osc-heading">
+        <div class="panel-heading"><h2 id="osc-heading">OSC出力</h2><span id="osc-status" class="status-text">設定を読み込み中</span></div>
+        <form id="osc-form">
+          <div class="osc-fields"><label>送信先ホスト<input id="osc-host" name="host" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false" required maxlength="253"></label><label>ポート<input id="osc-port" name="port" type="number" value="9000" min="1" max="65535" required></label><label>更新頻度 <span class="unit">Hz</span><input id="osc-rate" name="maxHz" type="number" value="20" min="1" max="120" step="1" required></label></div>
+          <div class="osc-actions"><label class="checkbox"><input id="osc-enabled" name="enabled" type="checkbox">OSC出力を有効にする</label><span id="osc-unsaved" class="unsaved" hidden>未適用</span><button id="osc-apply" class="primary" type="submit" disabled>適用</button></div>
+          <details class="advanced"><summary>詳細設定</summary><label>定期スナップショット間隔 <span class="unit">ms</span><input id="osc-snapshot" name="snapshotIntervalMs" type="number" value="1000" min="100" max="60000" step="100" required></label></details>
+          <p id="osc-error" class="form-message error" role="alert" hidden></p>
+        </form>
+      </section>
+    </section>
+    </div>
+  </dialog>
+  <script type="module" src="/app.js"></script>
+</body></html>
