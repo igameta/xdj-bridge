@@ -1,10 +1,15 @@
 import type { PacketEnvelope, Profile, StatusObservation } from './types.js';
 
 export const MAGIC = Buffer.from('5173707431576d4a4f4c', 'hex');
+/** Status byte 0x89, bit 0x20; also used by the public alphatheta decoder and
+ * Beat Link CdjStatus.isTempoMaster. This is tempo ownership, not On-Air. */
+export function tempoMasterFromFlags(flags: number | undefined): boolean | null {
+  return typeof flags === 'number' && Number.isInteger(flags) && flags >= 0 && flags <= 0xff ? (flags & 0x20) !== 0 : null;
+}
 const nameAt = (b: Buffer, offset: number) => b.subarray(offset, offset + 20).toString('ascii').replace(/\0.*$/, '').trim();
 export type DecodedPacket =
   | { kind: 'status'; status: StatusObservation }
-  | { kind: 'announcement'; wireDeviceId: number; model: string; mac: string }
+  | { kind: 'announcement'; wireDeviceId: number; model: string; mac: string; advertisedIp: string; deviceType: number }
   | { kind: 'beat'; wireDeviceId: number; model: string; beatInMeasure: number | null }
   | { kind: 'position'; wireDeviceId: number; model: string; positionMs: number }
   | { kind: 'media'; wireDeviceId: number; slot: number; fingerprint: string };
@@ -15,7 +20,11 @@ export function decodePacket(e: PacketEnvelope): DecodedPacket | null {
   if (!Number.isFinite(e.receivedAt) || e.receivedAt < 0 || b.length < 11 || !b.subarray(0, 10).equals(MAGIC)) return null;
   const type = b[10];
   if (e.destinationPort === 50000 && type === 6 && b.length >= 0x36 && b[0x24] > 0) {
-    return { kind: 'announcement', wireDeviceId: b[0x24], model: nameAt(b, 12), mac: b.subarray(0x26, 0x2c).toString('hex') };
+    const length = b.readUInt16BE(0x22), model = nameAt(b, 12);
+    if (b[0x20] !== 1 || ![2, 3].includes(b[0x21]) || length < 0x36 || length > b.length || !model || !/^[\x20-\x7e]+$/.test(model)) return null;
+    const advertisedIp = [...b.subarray(0x2c, 0x30)].join('.');
+    if (advertisedIp !== e.sourceIp) return null;
+    return { kind: 'announcement', wireDeviceId: b[0x24], model, mac: b.subarray(0x26, 0x2c).toString('hex'), advertisedIp, deviceType: b[0x34] };
   }
   if (e.destinationPort === 50002 && type === 0x0a && b.length >= 0xcc && b[0x21] > 0) {
     // 0x03/0x04 are standard player layouts; 0x05 is captured RX3. Unknown
@@ -30,7 +39,10 @@ export function decodePacket(e: PacketEnvelope): DecodedPacket | null {
       sessionId: e.sessionId, interfaceId: e.interfaceId, sourceIp: e.sourceIp,
       receivedAt: e.receivedAt, model, wireDeviceId: b[0x21],
       sourceWireDeviceId: b[0x28], protocolSlot: b[0x29], trackType: b[0x2a], trackId: b.readUInt32BE(0x2c),
-      playState: b[0x7b], statusFlags: b.length >= 0xd4 ? b[0x89] : undefined,
+      // The accepted layouts already guarantee byte 0x89. The public
+      // alphatheta decoder reads flags from packets >=0xc8; requiring 0xd4
+      // here would discard master observations in our valid 0xcc..0xd3 range.
+      playState: b[0x7b], statusFlags: b[0x89],
       trackBpm: bpm === 0xffff ? null : bpm / 100,
       pitchPercent: rawPitch <= 0x200000 ? (rawPitch / 0x100000 - 1) * 100 : null,
       beat: rawBeat === 0xffffffff || rawBeat === 0 ? null : rawBeat,

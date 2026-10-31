@@ -18,6 +18,7 @@ export interface AppConfig {
   publicDeckIds: Record<string, string>;
   duration?: number;
   osc?: { enabled?: boolean; host: string; port: number; maxHz?: number; snapshotIntervalMs?: number };
+  notifications?: { enabled?: boolean };
 }
 export const HELP = `XDJ Bridge — information acquisition / visualizer / OSC
 
@@ -25,19 +26,20 @@ export const HELP = `XDJ Bridge — information acquisition / visualizer / OSC
   npm run demo -- --demo-decks 4 --port 8081
   npm start -- --mode replay --capture ../captures/FILE.pcapng
   npm start -- --mode virtual-device --interface en6 --osc 127.0.0.1:9000
+  npm start -- --mode az-standalone --profile xdj-az --interface Ethernet
   npm start -- --mode passive --interface en6
   npm start -- --mode passive --backend alphatheta --interface en6
 
 Options:
   --config FILE          JSON configuration (see config.example.json)
-  --mode MODE            idle (default), demo, replay, passive, virtual-device
+  --mode MODE            idle (default), demo, replay, passive, virtual-device, az-standalone
   --backend NAME         native (default) or alphatheta (pcap passive only)
   --interface NAME       Explicit IPv4 interface for live acquisition
   --list-interfaces      List interfaces without network participation
   --capture FILE         Read a saved .pcap/.pcapng; never sends to hardware
   --profile NAME         auto, xdj-rx3, xdj-az, generic-prolink
   --demo-decks N         2 (RX3, default) or 4 (synthetic AZ); demo only
-  --device-number N      Optional virtual number 7–9; default selects a free one
+  --device-number N      Optional virtual-device number 7–9; not used by az-standalone
   --speed N              Capture playback speed >0..1000 (default 1)
   --loop / --no-loop     Repeat replay/demo (demo repeats by default)
   --port N               Visualizer port (default 8080)
@@ -49,6 +51,8 @@ Options:
 
 RX3: BPM/pitch/track ID/playback have capture evidence. Title, artist,
 waveform and position remain unknown until a real provider succeeds.
+AZ standalone: explicit experimental PC-presence mode. Keeps device Mode OFF;
+uses an observed-free number 5/6. Firmware 1.23 and Windows hardware unverified.
 `;
 
 export async function parseConfig(args: string[]): Promise<AppConfig> {
@@ -93,13 +97,15 @@ export async function parseConfig(args: string[]): Promise<AppConfig> {
     } else throw new Error(`Unknown option: ${arg}`);
   }
   if (!loopSpecified) result.loop = result.mode === 'demo';
-  if (!['idle', 'demo', 'replay', 'passive', 'virtual-device'].includes(result.mode)) throw new Error('Invalid --mode');
+  if (!['idle', 'demo', 'replay', 'passive', 'virtual-device', 'az-standalone'].includes(result.mode)) throw new Error('Invalid --mode');
   if (!['native', 'alphatheta'].includes(result.backend)) throw new Error('Invalid --backend');
   if (!['auto', 'xdj-rx3', 'xdj-az', 'generic-prolink'].includes(result.profile)) throw new Error('Invalid --profile');
   if (result.demoDecks !== 2 && result.demoDecks !== 4) throw new Error('--demo-decks must be 2 or 4');
   if (result.mode === 'demo' && ((result.demoDecks === 4 && result.profile === 'xdj-rx3') || (result.demoDecks === 2 && result.profile === 'xdj-az'))) throw new Error('Demo profile mismatch: use RX3/2 decks or AZ/4 decks (auto and generic-prolink are also allowed).');
   if (result.backend === 'alphatheta' && result.mode !== 'passive') throw new Error('alphatheta backend currently supports capture-only passive mode. Use native for virtual-device participation.');
-  if (['passive', 'virtual-device'].includes(result.mode) && !result.interfaceName) throw new Error('Live acquisition requires --interface; use --list-interfaces');
+  if (['passive', 'virtual-device', 'az-standalone'].includes(result.mode) && !result.interfaceName) throw new Error('Live acquisition requires --interface; use --list-interfaces');
+  if (result.mode === 'az-standalone' && !['auto', 'xdj-az'].includes(result.profile)) throw new Error('AZ standalone requires profile auto or xdj-az');
+  if (result.mode === 'az-standalone' && result.deviceNumber !== undefined) throw new Error('AZ standalone chooses an observed-free number 5/6; remove the forced deviceNumber/--device-number setting.');
   if (result.mode === 'replay' && !result.capture) throw new Error('Replay requires --capture FILE');
   if (!Number.isFinite(result.speed) || result.speed <= 0 || result.speed > 1000) throw new Error('Speed must be >0 and <=1000');
   if (!Number.isInteger(result.port) || result.port < 0 || result.port > 65535) throw new Error('Invalid HTTP port');
@@ -119,5 +125,6 @@ export async function parseConfig(args: string[]): Promise<AppConfig> {
     if (result.osc.maxHz !== undefined && (!Number.isFinite(result.osc.maxHz) || result.osc.maxHz < 1 || result.osc.maxHz > 120)) throw new Error('osc.maxHz must be >=1 and <=120');
     if (result.osc.snapshotIntervalMs !== undefined && (!Number.isFinite(result.osc.snapshotIntervalMs) || result.osc.snapshotIntervalMs < 100)) throw new Error('osc.snapshotIntervalMs must be >=100');
   }
+  if (result.notifications !== undefined && (!result.notifications || typeof result.notifications !== 'object' || Array.isArray(result.notifications) || (result.notifications.enabled !== undefined && typeof result.notifications.enabled !== 'boolean'))) throw new Error('notifications must be an object with optional boolean enabled');
   return result;
 }

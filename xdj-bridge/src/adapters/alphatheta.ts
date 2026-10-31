@@ -22,6 +22,7 @@ export function statusObservationFromLibrary(status: LibraryStatus, context: {
   return { ...context, wireDeviceId: status.deviceId, trackId: status.trackId,
     sourceWireDeviceId: status.trackDeviceId, protocolSlot: status.trackSlot, trackType: status.trackType,
     playState: status.playState, trackBpm: status.trackBPM, pitchPercent: status.effectivePitch,
+    tempoMaster: typeof status.isMaster === 'boolean' ? status.isMaster : undefined,
     beat: status.beat, beatInMeasure: status.beatInMeasure, source: 'alphatheta:public-status',
     raw: { playState: status.playState, isSync: status.isSync, isMaster: status.isMaster } };
 }

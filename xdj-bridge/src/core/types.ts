@@ -15,13 +15,15 @@ export interface PacketEnvelope {
   destinationIp: string;
   destinationPort: number;
   transport: 'udp' | 'pcap' | 'replay' | 'alphatheta';
+  /** Native UDP cannot prove the receiving IF; subnet is an explicit inference. */
+  interfaceEvidence?: 'subnet' | 'capture' | 'unknown';
   bytes: Buffer;
   /** Monotonic session-relative milliseconds, never Date.now(). */
   receivedAt: number;
 }
 export interface SessionState {
   id: string;
-  mode: 'idle' | 'replay' | 'demo' | 'passive' | 'virtual-device' | 'alphatheta';
+  mode: 'idle' | 'replay' | 'demo' | 'passive' | 'virtual-device' | 'az-standalone' | 'alphatheta';
   state: 'disconnected' | 'observing' | 'joining' | 'online' | 'degraded';
   interfaceId: string | null;
   reason: string | null;
@@ -70,6 +72,7 @@ export interface DeckState {
   title: Field<string>;
   artist: Field<string>;
   playbackState: Field<PlaybackState>;
+  tempoMaster: Field<boolean>;
   trackBpm: Field<number>;
   effectiveBpm: Field<number>;
   pitchPercent: Field<number>;
@@ -80,11 +83,38 @@ export interface DeckState {
   capabilities: Record<string, Capability>;
   raw: Record<string, unknown>;
 }
+export interface RepresentativeState {
+  deckId: string | null;
+  publicDeckId: string | null;
+  reason: 'tempo-master' | 'playing' | 'none';
+}
+export interface DiscoveredDevice {
+  id: string;
+  model: string;
+  sourceIp: string;
+  wireDeviceId: number;
+  interfaceId: string | null;
+  interfaceEvidence: 'subnet' | 'capture' | 'unknown';
+  advertisedIp: string | null;
+  mac: string | null;
+  lastSeenAt: number;
+  lastStatusAt: number | null;
+  status: 'announced' | 'receiving' | 'stale' | 'unassigned';
+  reason: string | null;
+}
+export interface DeviceObservation {
+  model: string; sourceIp: string; wireDeviceId: number; interfaceId: string | null;
+  interfaceEvidence: DiscoveredDevice['interfaceEvidence'];
+  receivedAt: number; advertisedIp?: string | null; mac?: string | null;
+  hasStatus?: boolean; reason?: string | null;
+}
 export interface Snapshot {
   schemaVersion: 1;
   revision: number;
   session: SessionState;
   decks: DeckState[];
+  devices: DiscoveredDevice[];
+  representative: RepresentativeState;
   diagnostics: Diagnostic[];
 }
 export interface StateSource {
@@ -107,6 +137,8 @@ export interface StatusObservation {
   trackBpm: number | null;
   pitchPercent: number | null;
   statusFlags?: number;
+  /** Explicit observation from a public status API; absent means unavailable. */
+  tempoMaster?: boolean;
   beat?: number | null;
   beatInMeasure?: number | null;
   positionMs?: number | null;

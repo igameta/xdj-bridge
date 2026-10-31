@@ -1,5 +1,6 @@
 import dgram from 'node:dgram';
-import type { Field, Snapshot, StateSource } from '../core/types.js';
+import type { DeckState, Field, Snapshot, StateSource } from '../core/types.js';
+import { selectRepresentative } from '../core/representative.js';
 
 export type OscArgument = number | string;
 export interface OscMessage { address: string; args: OscArgument[]; types?: string }
@@ -81,7 +82,7 @@ function fieldMessages(path: string, field: Field<unknown>, transform?: (value: 
   const value = field.value !== null && transform ? transform(field.value) : field.value;
   // A field too large for our bounded datagram must invalidate any previous
   // receiver value; never announce valid=1 and then omit its payload.
-  const fits = typeof value !== 'string' || Buffer.byteLength(value, 'utf8') <= 512;
+  const fits = typeof value === 'string' ? Buffer.byteLength(value, 'utf8') <= 512 : typeof value === 'number' ? Number.isFinite(value) : typeof value === 'boolean';
   const valid = field.value !== null && field.quality !== 'unknown' && field.freshness === 'fresh' && fits;
   const messages: OscMessage[] = [
     { address: path + '/valid', args: [valid ? 1 : 0], types: 'i' },
@@ -96,12 +97,53 @@ function fieldMessages(path: string, field: Field<unknown>, transform?: (value: 
   return messages;
 }
 
+function playbackMessages(base: string, deck?: DeckState): OscMessage[] {
+  const knownPlayback = ['playing', 'looping', 'cue_playing', 'paused', 'cued', 'stopped', 'ended', 'no_track'];
+  const playing: Field<unknown> = deck ? { ...deck.playbackState } : unavailableField();
+  if (!knownPlayback.includes(String(playing.value))) { playing.value = null; playing.quality = 'unknown'; }
+  return fieldMessages(base + '/playing', playing, value => ['playing', 'looping', 'cue_playing'].includes(String(value)));
+}
+
+function unavailableField(): Field<unknown> {
+  return { value: null, quality: 'unknown', source: 'representative-unavailable', observedAt: null, freshness: 'stale' };
+}
+
+/** The shared selector rechecks private OSC invalidation views as well as the
+ * ordinary normalized snapshot; retained representative IDs cannot outlive a
+ * disconnected or stale source. */
+function representativeMessages(snapshot: Snapshot): OscMessage[] {
+  const representative = selectRepresentative(snapshot, snapshot.representative?.deckId);
+  const deck = snapshot.decks.find(item => item.deckId === representative.deckId);
+  const base = '/dj/representative';
+  const messages: OscMessage[] = [
+    { address: base + '/valid', args: [deck ? 1 : 0], types: 'i' },
+    { address: base + '/reason', args: [representative.reason] },
+  ];
+  if (deck) {
+    messages.push({ address: base + '/public_deck_id', args: [deck.publicDeckId!] });
+  }
+  const identity: Field<string> = deck ? { value: deck.deckId, quality: 'observed', source: 'representative-identity', observedAt: deck.playbackState.observedAt, freshness: 'fresh' } : { ...unavailableField(), value: null };
+  messages.push(...fieldMessages(base + '/deck_id', identity));
+  for (const [name, field] of [
+    ['bpm', deck?.trackBpm], ['effective_bpm', deck?.effectiveBpm],
+    ['pitch_percent', deck?.pitchPercent], ['tempo_master', deck?.tempoMaster],
+  ] as const) messages.push(...fieldMessages(base + '/' + name, field ?? unavailableField()));
+  messages.push(...playbackMessages(base, deck));
+  return messages;
+}
+
+const REPRESENTATIVE_HEADERS = new Set([
+  '/dj/representative/valid', '/dj/representative/reason',
+  '/dj/representative/public_deck_id',
+]);
+
 export function snapshotToOsc(snapshot: Snapshot): OscMessage[] {
   const messages: OscMessage[] = [
     { address: '/dj/schema_version', args: [snapshot.schemaVersion], types: 'i' },
     { address: '/dj/session_id', args: [snapshot.session.id] },
     { address: '/dj/revision', args: [String(snapshot.revision)] },
   ];
+  messages.push(...representativeMessages(snapshot));
   for (const deck of snapshot.decks) {
     if (typeof deck.publicDeckId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(deck.publicDeckId)) continue;
     const base = '/dj/decks/' + deck.publicDeckId;
@@ -111,16 +153,13 @@ export function snapshotToOsc(snapshot: Snapshot): OscMessage[] {
     const fields = [
       ['bpm', deck.trackBpm], ['effective_bpm', deck.effectiveBpm], ['pitch_percent', deck.pitchPercent],
       ['position_ms', deck.positionMs], ['beat', deck.beat], ['beat_phase', deck.beatPhase],
-      ['on_air', deck.onAir], ['title', deck.title], ['artist', deck.artist],
+      ['on_air', deck.onAir], ['tempo_master', deck.tempoMaster ?? unavailableField()], ['title', deck.title], ['artist', deck.artist],
       ['track_id', referenceField(deck.trackRef ? String(deck.trackRef.trackId) : null)],
       ['source_slot', referenceField(deck.trackRef?.protocolSlot ?? null)],
       ['source_device_id', referenceField(deck.trackRef?.sourceDeviceId ?? null)],
     ] as const;
     for (const [name, field] of fields) messages.push(...fieldMessages(base + '/' + name, field));
-    const knownPlayback = ['playing', 'looping', 'cue_playing', 'paused', 'cued', 'stopped', 'ended', 'no_track'];
-    const playing = { ...deck.playbackState };
-    if (!knownPlayback.includes(String(playing.value))) { playing.value = null; playing.quality = 'unknown'; }
-    messages.push(...fieldMessages(base + '/playing', playing, value => ['playing', 'looping', 'cue_playing'].includes(String(value))));
+    messages.push(...playbackMessages(base, deck));
   }
   return messages;
 }
@@ -152,9 +191,11 @@ export function startOsc(store: StateSource, options: OscOptions): { close(): Pr
   const intervalMs = Math.ceil(1000 / maxHz);
   const transmit = async (snapshot: Snapshot): Promise<void> => {
     const allMessages = snapshotToOsc(snapshot);
-    const headers = allMessages.slice(0, 3);
+    // Every datagram names the representative for this revision. A receiver
+    // can never mistake a BPM fragment for a previously selected deck.
+    const headers = [...allMessages.slice(0, 3), ...allMessages.filter(message => REPRESENTATIVE_HEADERS.has(message.address))];
     const headerBytes = headers.reduce((size, message) => size + encodeOscMessage(message).length + 4, 16);
-    const messages = allMessages.slice(3);
+    const messages = allMessages.slice(3).filter(message => !REPRESENTATIVE_HEADERS.has(message.address));
     // Keep UDP packets below the usual Ethernet MTU; strings are capped per packet.
     const batches: OscMessage[][] = [];
     let batch: OscMessage[] = [...headers];

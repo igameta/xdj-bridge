@@ -29,7 +29,11 @@ try {
   receiver.bind(0, '127.0.0.1'); await once(receiver, 'listening');
   const oscPort = receiver.address().port;
   const messages = [];
-  receiver.on('message', bytes => messages.push(...decodeOscPacket(bytes)));
+  const packets = [];
+  receiver.on('message', bytes => {
+    const decoded = decodeOscPacket(bytes);
+    packets.push({ length: bytes.length, messages: decoded }); messages.push(...decoded);
+  });
   const child = spawn(process.execPath, ['dist/src/main.js', '--mode', 'demo', '--demo-decks', '4', '--duration', '0.8', '--port', '0', '--osc', `127.0.0.1:${oscPort}`], { cwd: runtime, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '', errors = '';
   child.stderr.on('data', chunk => { errors += chunk; });
@@ -45,9 +49,15 @@ try {
   });
   const response = await fetch(`${url}/api/state`);
   const state = await response.json();
+  const runtimeSettings = await (await fetch(`${url}/api/runtime`)).json();
+  assert.equal(runtimeSettings.notifications.enabled, false);
+  assert.equal(typeof runtimeSettings.notifications.supported, 'boolean');
+  assert.equal(runtimeSettings.notifications.error, null);
   assert.equal(state.session.mode, 'demo'); assert.equal(state.decks.length, 4);
   assert.deepEqual(state.decks.map(deck => deck.publicDeckId), ['1', '2', '3', '4']);
   assert.deepEqual(state.decks.map(deck => deck.trackBpm.value), [122, 125, 128, 130]);
+  assert.equal(state.representative.publicDeckId, '1');
+  assert.equal(state.representative.reason, 'playing');
   for (const deck of state.decks) {
     assert.equal(deck.positionMs.value, null); assert.equal(deck.beat.value, null); assert.equal(deck.title.value, null);
     assert.equal(deck.capabilities.status.verification, 'implemented-unverified');
@@ -62,5 +72,19 @@ try {
     assert.ok(validity.includes(1), `runtime should emit demo OSC for deck ${deck}`);
     assert.equal(validity.at(-1), 0, `runtime shutdown must invalidate OSC deck ${deck}`);
   }
-  console.log('Extracted compiled runtime: production-only install, HTTP/UI, four decks, OSC UDP for decks 1–4, final invalidation and clean shutdown passed.');
+  const representativeValidity = messages.filter(message => message.address === '/dj/representative/valid').map(message => message.args[0]);
+  assert.ok(representativeValidity.includes(1), 'runtime should select and emit a representative');
+  assert.equal(representativeValidity.at(-1), 0, 'shutdown must clear representative identity');
+  assert.ok(messages.some(message => message.address === '/dj/representative/effective_bpm'), 'representative BPM must be emitted');
+  const representativeBpmValidity = messages.filter(message => message.address === '/dj/representative/effective_bpm/valid').map(message => message.args[0]);
+  assert.ok(representativeBpmValidity.includes(1));
+  assert.equal(representativeBpmValidity.at(-1), 0, 'shutdown must invalidate representative BPM');
+  for (const packet of packets) {
+    assert.ok(packet.length <= 1200);
+    const valid = packet.messages.find(message => message.address === '/dj/representative/valid')?.args[0];
+    assert.ok(valid === 0 || valid === 1, 'every datagram needs representative binding validity');
+    assert.ok(packet.messages.some(message => message.address === '/dj/representative/reason'));
+    if (valid === 1) assert.deepEqual(packet.messages.find(message => message.address === '/dj/representative/public_deck_id')?.args, ['1']);
+  }
+  console.log('Extracted compiled runtime: production-only install, HTTP/UI, four decks, per-deck and representative OSC UDP, fragment identity, final invalidation and clean shutdown passed.');
 } finally { await rm(temp, { recursive: true, force: true }); }

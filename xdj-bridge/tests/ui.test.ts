@@ -9,10 +9,17 @@ import type { Snapshot } from '../src/core/types.js';
 const html = await readFile(new URL('../../public/index.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../../public/app.js', import.meta.url), 'utf8');
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+interface DiscoveryDevice {
+  id: string; model: string; sourceIp: string; wireDeviceId: number; ageMs: number;
+  status: 'announced' | 'receiving' | 'stale' | 'unassigned'; interfaceId: string | null;
+  interfaceEvidence: 'subnet' | 'capture' | 'unknown'; reason: string | null; lastStatusAt?: number | null;
+}
 const initialRuntime = () => ({
   connection: { mode: 'virtual-device', backend: 'native', profile: 'xdj-rx3', interfaceName: 'en6', connected: true, connecting: false, error: null },
   interfaces: [{ name: 'en6', address: '169.254.60.99' }, { name: 'en0', address: '192.0.2.1' }],
   osc: { enabled: false, host: '127.0.0.1', port: 9000, maxHz: 20, snapshotIntervalMs: 1000 },
+  notifications: { enabled: false, supported: true, error: null as string | null },
+  discovery: { searching: false, attempted: false, interfaceName: 'en6' as string | null, source: 'session' as 'session' | 'scan', devices: [] as DiscoveryDevice[], error: null as string | null },
 });
 function seed(): Snapshot {
   const store = new StateStore({ sessionId: 'ui', mode: 'virtual-device' });
@@ -30,12 +37,17 @@ function seedFourDecks(): Snapshot {
 }
 async function harness() {
   const { document, window } = parseHTML(html);
+  for (const form of document.querySelectorAll('form')) (form as any).reportValidity = () => true;
   // linkedom has no select setter, focus manager or modal top layer; provide
   // their browser contracts while exercising the actual application script.
   Object.defineProperty(window.HTMLSelectElement.prototype, 'value', {
     configurable: true,
     get() { const options = [...this.querySelectorAll('option')]; return (options.find(option => option.selected) ?? options[0])?.value ?? ''; },
-    set(value: string) { for (const option of this.querySelectorAll('option')) option.selected = option.value === String(value); },
+    set(value: string) {
+      const options = [...this.querySelectorAll('option')];
+      for (const option of options) option.removeAttribute('selected');
+      options.find(option => option.value === String(value))?.setAttribute('selected', '');
+    },
   });
   let active: any = document.body;
   Object.defineProperty(document, 'activeElement', { get: () => active });
@@ -49,7 +61,9 @@ async function harness() {
   const timers = new Map<number, { callback: () => void; at: number }>();
   const intervals: Array<() => void> = [];
   let currentRuntime = initialRuntime();
-  const requests: Array<{ url: string; method: string }> = [];
+  let notificationsFailure: string | null = null;
+  let discoveryFailure: string | null = null;
+  const requests: Array<{ url: string; method: string; body?: unknown }> = [];
   class FakeSocket {
     static instance: FakeSocket;
     listeners = new Map<string, Array<(event: any) => void>>();
@@ -65,8 +79,23 @@ async function harness() {
     clearTimeout: (id: number) => timers.delete(id),
     setInterval: (callback: () => void) => { intervals.push(callback); return intervals.length; }, clearInterval: () => {},
     addEventListener: () => {},
-    fetch: async (url: string, options: { method?: string } = {}) => {
-      requests.push({ url, method: options.method ?? 'GET' });
+    fetch: async (url: string, options: { method?: string; body?: string } = {}) => {
+      const body = options.body ? JSON.parse(options.body) : undefined;
+      requests.push({ url, method: options.method ?? 'GET', ...(body ? { body } : {}) });
+      if (url === '/api/notifications' && options.method === 'POST') {
+        if (notificationsFailure) return { ok: false, json: async () => ({ error: notificationsFailure }) };
+        currentRuntime = { ...currentRuntime, notifications: { ...currentRuntime.notifications, enabled: body.enabled, error: null } };
+      }
+      if (url === '/api/discovery' && options.method === 'POST') {
+        if (discoveryFailure) return { ok: false, json: async () => ({ error: discoveryFailure }) };
+        if (currentRuntime.connection.connected && body.interfaceName !== currentRuntime.connection.interfaceName) return { ok: false, json: async () => ({ error: '接続中とは別のLANは探索できません。' }) };
+        currentRuntime = { ...currentRuntime, discovery: { ...currentRuntime.discovery, searching: true, attempted: true,
+          interfaceName: body.interfaceName, source: currentRuntime.connection.connected ? 'session' : 'scan', error: null } };
+      }
+      if (url === '/api/connection' && options.method === 'POST') {
+        currentRuntime = { ...currentRuntime, connection: body.action === 'disconnect' ? { ...currentRuntime.connection, connected: false, connecting: false } :
+          { ...currentRuntime.connection, mode: body.mode, backend: body.backend, profile: body.profile, interfaceName: body.interfaceName, connected: false, connecting: true } };
+      }
       return { ok: true, json: async () => structuredClone(currentRuntime) };
     },
   });
@@ -84,6 +113,8 @@ async function harness() {
   return { document, window, requests, advance, socket: FakeSocket.instance!,
     receive: (message: unknown) => FakeSocket.instance.emit('message', { data: JSON.stringify(message) }),
     poll: async (next = currentRuntime) => { currentRuntime = next; for (const callback of intervals) callback(); await turn(); },
+    rejectNotifications: (error: string | null) => { notificationsFailure = error; },
+    rejectDiscovery: (error: string | null) => { discoveryFailure = error; },
   };
 }
 
@@ -308,4 +339,205 @@ test('UI: fresh playback highlights the whole card and clears reliably for stopp
     decks: state.decks.map(deck => ({ ...deck, stateRevision: deck.stateRevision + 1, playbackState: { ...deck.playbackState, quality: 'unknown' } })),
     removedDeckIds: [], diagnostics: state.diagnostics }); h.advance(50);
   assert.equal(h.document.querySelectorAll('.deck.is-playing').length, 0, 'unknown playback quality must not assert active playback');
+});
+
+test('UI: notification setting defaults off, preserves unsaved changes and applies only through its API', async () => {
+  const h = await harness();
+  const toggle: any = h.document.getElementById('notifications-enabled');
+  const apply: any = h.document.getElementById('notifications-apply');
+  const status = h.document.getElementById('notifications-status')!;
+  assert.equal(toggle.checked, false); assert.equal(toggle.disabled, false); assert.equal(apply.disabled, true);
+  assert.equal(status.textContent, 'OFF');
+  h.document.getElementById('settings-button')!.click();
+  toggle.checked = true; toggle.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const host: any = h.document.getElementById('osc-host'); host.value = '192.0.2.55'; host.dispatchEvent(new h.window.Event('input', { bubbles: true }));
+  h.document.getElementById('settings-close')!.click();
+  h.document.getElementById('settings-button')!.click(); await h.poll();
+  assert.equal(toggle.checked, true); assert.equal(status.textContent, 'OFF', 'selection is separate from the actual runtime setting');
+  assert.equal(h.document.getElementById('notifications-unsaved')!.hidden, false);
+  assert.equal(h.requests.some(request => request.method === 'POST'), false, 'opening the menu and editing a checkbox must not send settings');
+  h.document.getElementById('notifications-form')!.dispatchEvent(new h.window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.equal(toggle.disabled, true); await turn();
+  const notificationsRequests = h.requests.filter(request => request.url === '/api/notifications');
+  assert.equal(notificationsRequests.length, 1); assert.deepEqual(notificationsRequests[0].body, { enabled: true });
+  assert.equal(status.textContent, 'ON'); assert.equal(toggle.checked, true); assert.equal(apply.disabled, true);
+  assert.equal(h.document.getElementById('notifications-unsaved')!.hidden, true);
+  assert.equal(host.value, '192.0.2.55', 'notification runtime response must preserve unrelated OSC edits');
+  assert.equal(h.document.getElementById('osc-unsaved')!.hidden, false);
+  toggle.checked = false; toggle.dispatchEvent(new h.window.Event('input', { bubbles: true }));
+  assert.equal(status.textContent, 'ON');
+  h.document.getElementById('notifications-form')!.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  assert.deepEqual(h.requests.filter(request => request.url === '/api/notifications').at(-1)!.body, { enabled: false });
+  assert.equal(status.textContent, 'OFF');
+});
+
+test('UI: unsupported notification platforms are explicit and cannot submit an enable request', async () => {
+  const h = await harness();
+  const unsupported = initialRuntime(); unsupported.notifications.supported = false;
+  await h.poll(unsupported);
+  const toggle: any = h.document.getElementById('notifications-enabled');
+  const apply: any = h.document.getElementById('notifications-apply');
+  assert.equal(toggle.disabled, true); assert.equal(apply.disabled, true);
+  assert.equal(h.document.getElementById('notifications-status')!.textContent, '未対応のOS');
+  assert.match(h.document.getElementById('notifications-hint')!.textContent ?? '', /このOSでは通知を利用できません/);
+  h.document.getElementById('notifications-form')!.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  assert.equal(h.requests.some(request => request.url === '/api/notifications'), false);
+});
+
+test('UI: notification API errors retain dirty selection and remote errors clear independently', async () => {
+  const h = await harness();
+  const toggle: any = h.document.getElementById('notifications-enabled');
+  const form = h.document.getElementById('notifications-form')!;
+  const error = h.document.getElementById('notifications-error')!;
+  toggle.checked = true; toggle.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  h.rejectNotifications('通知設定を適用できませんでした。');
+  form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  assert.equal(error.textContent, '通知設定を適用できませんでした。'); assert.equal(error.hidden, false);
+  assert.equal(toggle.checked, true); assert.equal(h.document.getElementById('notifications-unsaved')!.hidden, false);
+  const failed = initialRuntime(); failed.notifications.error = 'OS側で通知の送信に失敗しました。';
+  await h.poll(failed);
+  assert.match(error.textContent ?? '', /適用できません/); assert.match(error.textContent ?? '', /OS側/);
+  assert.equal(h.document.getElementById('notifications-status')!.textContent, 'エラー');
+  await h.poll(initialRuntime());
+  assert.equal(error.textContent, '通知設定を適用できませんでした。', 'healthy polling only clears the remote error');
+  assert.equal(toggle.checked, true, 'polling must not replace a rejected user selection');
+  h.rejectNotifications(null); form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  assert.equal(error.hidden, true); assert.equal(h.document.getElementById('notifications-status')!.textContent, 'ON');
+  assert.match(h.document.getElementById('notifications-hint')!.textContent ?? '', /OSの通知設定/);
+});
+
+test('UI: LAN discovery shows all models and distinguishes announcements, status reception and unassigned interfaces', async () => {
+  const h = await harness();
+  const found = initialRuntime();
+  found.discovery.devices = [
+    { id: 'az', model: 'XDJ-AZ', sourceIp: '192.0.2.22', wireDeviceId: 2, ageMs: 1200, status: 'receiving', interfaceId: 'en6', interfaceEvidence: 'subnet', reason: null },
+    { id: 'az-deck4', model: 'XDJ-AZ', sourceIp: '192.0.2.22', wireDeviceId: 4, ageMs: 1500, status: 'announced', interfaceId: 'en6', interfaceEvidence: 'subnet', reason: null, lastStatusAt: 0 },
+    { id: 'cdj', model: 'CDJ-3000', sourceIp: '192.0.2.21', wireDeviceId: 1, ageMs: 0, status: 'announced', interfaceId: 'en6', interfaceEvidence: 'subnet', reason: null },
+    { id: 'old', model: 'CDJ-2000', sourceIp: '192.0.2.23', wireDeviceId: 3, ageMs: 62000, status: 'stale', interfaceId: 'en6', interfaceEvidence: 'capture', reason: null, lastStatusAt: null },
+    { id: 'unknown-lan', model: 'CDJ-3000X', sourceIp: '198.51.100.1', wireDeviceId: 4, ageMs: 4000, status: 'unassigned', interfaceId: null, interfaceEvidence: 'unknown', reason: '受信元が選択インターフェースと異なるサブネットです。' },
+  ];
+  await h.poll(found);
+  assert.equal((h.document.getElementById('device-select') as any).value, 'xdj-rx3');
+  const rows = [...h.document.querySelectorAll('.discovery-device')];
+  assert.equal(rows.length, 5, 'the selected RX3 profile must not hide AZ or CDJ announcements, including multiple wire IDs on one unit');
+  assert.match(h.document.getElementById('discovery-status')!.textContent ?? '', /検出 5件/);
+  assert.deepEqual(rows.map(row => row.querySelector('.discovery-device-model')!.textContent), ['CDJ-3000', 'XDJ-AZ', 'XDJ-AZ', 'CDJ-2000', 'CDJ-3000X']);
+  assert.deepEqual(rows.map(row => row.querySelector('.discovery-device-state')!.textContent), ['機器通知のみ', '状態受信中', '状態受信停止', '通知が途絶', 'LAN未確定']);
+  assert.match(rows[0].querySelector('.discovery-device-address')!.textContent ?? '', /192\.0\.2\.21 · 通信番号 1/);
+  assert.match(rows[0].querySelector('.discovery-device-last-seen')!.textContent ?? '', /たった今.*en6（IF推定）/);
+  assert.match(rows[3].querySelector('.discovery-device-last-seen')!.textContent ?? '', /1分前.*IF確認/);
+  assert.match(rows[4].querySelector('.discovery-device-last-seen')!.textContent ?? '', /IF未確定/);
+  assert.match(rows[4].querySelector('.discovery-device-reason')!.textContent ?? '', /異なるサブネット/);
+  assert.match(h.document.getElementById('discovery-profile-hint')!.textContent ?? '', /自動検出/);
+  const device: any = h.document.getElementById('device-select'); device.value = 'xdj-az'; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const reordered = structuredClone(found); reordered.discovery.devices.reverse(); await h.poll(reordered);
+  assert.deepEqual([...h.document.querySelectorAll('.discovery-device')], rows, 'arrival order changes must not rebuild or reorder stable device rows');
+  assert.equal(device.value, 'xdj-az', 'discovery updates must preserve an uncommitted profile choice');
+  assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  assert.ok(h.document.getElementById('discovery-devices')!.closest('dialog'), 'device discovery belongs inside the settings menu');
+});
+
+test('UI: discovery observes the active LAN without connection changes and retains every unsaved setting', async () => {
+  const h = await harness();
+  h.document.getElementById('settings-button')!.click();
+  const device: any = h.document.getElementById('device-select'); device.value = 'auto'; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const host: any = h.document.getElementById('osc-host'); host.value = '192.0.2.55'; host.dispatchEvent(new h.window.Event('input', { bubbles: true }));
+  const notifications: any = h.document.getElementById('notifications-enabled'); notifications.checked = true; notifications.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const button: any = h.document.getElementById('discovery-button');
+  assert.equal(h.document.getElementById('discovery-help')!.hidden, true);
+  button.click(); assert.equal(button.disabled, true); await turn();
+  const posts = h.requests.filter(request => request.method === 'POST');
+  assert.equal(posts.length, 1); assert.equal(posts[0].url, '/api/discovery'); assert.deepEqual(posts[0].body, { interfaceName: 'en6' });
+  assert.equal(button.textContent, '探索中…'); assert.equal(button.disabled, true);
+  assert.match(h.document.getElementById('discovery-status')!.textContent ?? '', /接続中の受信を確認/);
+  assert.equal((h.document.getElementById('disconnect-button') as any).disabled, false, 'discovery must not disconnect the existing source');
+  assert.equal(device.value, 'auto'); assert.equal(host.value, '192.0.2.55'); assert.equal(notifications.checked, true);
+  assert.equal(h.document.getElementById('notifications-unsaved')!.hidden, false);
+  assert.equal(h.document.getElementById('osc-unsaved')!.hidden, false);
+  const completed = initialRuntime(); completed.discovery.attempted = true; await h.poll(completed);
+  assert.equal(button.disabled, false); assert.equal(button.textContent, '機器を探す');
+  assert.match(h.document.querySelector('.discovery-empty')!.textContent ?? '', /この探索時間内に機器通知を受信できませんでした/);
+  assert.match(h.document.getElementById('discovery-help')!.textContent ?? '', /WindowsではNode.jsの受信許可/);
+  assert.equal(h.document.getElementById('discovery-az-note')!.hidden, true);
+  assert.equal(device.value, 'auto'); assert.equal(host.value, '192.0.2.55'); assert.equal(notifications.checked, true);
+  device.value = 'xdj-az'; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  assert.match(h.document.getElementById('discovery-az-note')!.textContent ?? '', /PRO DJ LINK.*Deck 3\/4/);
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 1, 'hints and profile selection must not change equipment settings');
+});
+
+test('UI: discovery errors preserve LAN selection and do not fall back to disconnecting the active source', async () => {
+  const h = await harness();
+  const select: any = h.document.getElementById('interface-select'); select.value = 'en0'; select.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const button: any = h.document.getElementById('discovery-button'); button.click(); await turn();
+  assert.match(h.document.getElementById('discovery-error')!.textContent ?? '', /別のLANは探索できません/);
+  assert.equal(select.value, 'en0'); assert.equal((h.document.getElementById('disconnect-button') as any).disabled, false);
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 1);
+  assert.equal(h.requests.some(request => request.url === '/api/connection'), false);
+  await h.poll(); assert.equal(select.value, 'en0'); assert.equal(h.document.getElementById('discovery-error')!.hidden, false);
+  select.value = 'en6'; select.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  h.rejectDiscovery('UDP 50000を確保できません。'); button.click(); await turn();
+  assert.match(h.document.getElementById('discovery-error')!.textContent ?? '', /UDP 50000/);
+  h.rejectDiscovery(null); button.click(); await turn();
+  assert.equal(h.document.getElementById('discovery-error')!.hidden, true);
+});
+
+test('UI: AZ standalone is explicit, experimental and submits only a compatible native connection', async () => {
+  const h = await harness();
+  h.document.getElementById('settings-button')!.click();
+  const method: any = h.document.getElementById('method-select');
+  const device: any = h.document.getElementById('device-select');
+  const connect: any = h.document.getElementById('connect-button');
+  assert.match(method.querySelector('option[value="az-standalone"]')!.textContent ?? '', /試験/);
+  method.value = 'az-standalone'; method.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  for (const incompatible of ['xdj-rx3', 'generic-prolink']) {
+    device.value = incompatible; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+    assert.equal(connect.disabled, true); assert.equal(device.value, incompatible, 'an incompatible profile must not be switched automatically');
+    assert.match(h.document.getElementById('connection-error')!.textContent ?? '', /自動検出.*XDJ-AZ/);
+    h.document.getElementById('connection-form')!.dispatchEvent(new h.window.Event('submit', { cancelable: true }));
+  }
+  assert.equal(h.requests.some(request => request.method === 'POST'), false, 'selecting an experimental mode must not transmit');
+  device.value = 'auto'; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  const host: any = h.document.getElementById('osc-host'); host.value = '192.0.2.88'; host.dispatchEvent(new h.window.Event('input', { bubbles: true }));
+  const notifications: any = h.document.getElementById('notifications-enabled'); notifications.checked = true; notifications.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  await h.poll();
+  assert.equal(method.value, 'az-standalone'); assert.equal(device.value, 'auto'); assert.equal(connect.disabled, false);
+  assert.match(h.document.getElementById('connection-hint')!.textContent ?? '', /ModeはOFFのまま.*PC型参加.*実機未検証/);
+  assert.equal(h.document.getElementById('connection-error')!.hidden, true);
+  h.document.getElementById('connection-form')!.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  const posts = h.requests.filter(request => request.method === 'POST');
+  assert.equal(posts.length, 1); assert.equal(posts[0].url, '/api/connection');
+  assert.deepEqual(posts[0].body, { action: 'connect', profile: 'auto', interfaceName: 'en6', mode: 'az-standalone', backend: 'native' });
+  assert.equal(method.value, 'az-standalone'); assert.equal(host.value, '192.0.2.88'); assert.equal(notifications.checked, true);
+  assert.equal(h.document.getElementById('osc-unsaved')!.hidden, false); assert.equal(h.document.getElementById('notifications-unsaved')!.hidden, false);
+  const active = initialRuntime(); active.connection.mode = 'az-standalone'; active.connection.profile = 'auto'; active.discovery.attempted = true;
+  await h.poll(active);
+  const state = seedFourDecks(); h.receive({ type: 'snapshot', ...state, session: { ...state.session, mode: 'az-standalone' } }); h.advance(1);
+  assert.equal(h.document.getElementById('source-mode')!.textContent, 'AZスタンドアロン・試験');
+  assert.equal(h.document.getElementById('session-status')!.textContent, '受信中');
+  assert.equal(h.document.querySelectorAll('.deck').length, 4);
+  assert.equal(h.document.getElementById('discovery-az-note')!.hidden, true, 'standalone must not suggest the setting that disables Deck 3/4');
+  assert.doesNotMatch(h.document.getElementById('discovery-help')!.textContent ?? '', /PRO DJ LINK|有効/);
+  assert.match(h.document.getElementById('connection-hint')!.textContent ?? '', /実機未検証/);
+});
+
+test('UI: AZ standalone runtime restores its selection and uncommitted normal methods remain intact', async () => {
+  const h = await harness();
+  const active = initialRuntime(); active.connection.mode = 'az-standalone'; active.connection.profile = 'xdj-az'; active.discovery.attempted = true;
+  await h.poll(active);
+  const method: any = h.document.getElementById('method-select');
+  const device: any = h.document.getElementById('device-select');
+  assert.equal(method.value, 'az-standalone'); assert.equal(device.value, 'xdj-az');
+  assert.equal((h.document.getElementById('connect-button') as any).disabled, false);
+  assert.equal(h.document.getElementById('discovery-az-note')!.hidden, true);
+  assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  device.value = 'xdj-rx3'; device.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  for (const normal of ['virtual-device', 'passive', 'pcap']) {
+    method.value = normal; method.dispatchEvent(new h.window.Event('change', { bubbles: true })); await h.poll(active);
+    assert.equal(method.value, normal); assert.equal(device.value, 'xdj-rx3');
+    assert.equal((h.document.getElementById('connect-button') as any).disabled, false);
+    assert.doesNotMatch(h.document.getElementById('connection-hint')!.textContent ?? '', /PC型参加|実機未検証/);
+  }
+  h.document.getElementById('connection-form')!.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await turn();
+  const post = h.requests.find(request => request.method === 'POST')!;
+  assert.deepEqual(post.body, { action: 'connect', profile: 'xdj-rx3', interfaceName: 'en6', mode: 'passive', backend: 'alphatheta' });
 });

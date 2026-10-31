@@ -1,10 +1,11 @@
 const $ = id => document.getElementById(id);
 const stateLabels = { disconnected:'切断', observing:'機器を検出中', joining:'参加中', online:'受信中', degraded:'受信が途絶えています' };
 const sessionStatusLabels = { disconnected:'未接続', observing:'検出中', joining:'参加中', online:'受信中', degraded:'受信停止' };
-const modeLabels = { idle:'', demo:'', replay:'キャプチャ再生', passive:'受信のみ', 'virtual-device':'仮想参加', alphatheta:'Pro DJ Link' };
+const modeLabels = { idle:'', demo:'', replay:'キャプチャ再生', passive:'受信のみ', 'virtual-device':'仮想参加', 'az-standalone':'AZスタンドアロン・試験', alphatheta:'Pro DJ Link' };
 const playLabels = { playing:'再生中', looping:'ループ再生', cue_playing:'CUE再生', paused:'一時停止', cued:'CUE', stopped:'停止', ended:'終了', loading:'ロード中', no_track:'曲なし', unknown:'不明' };
 const deckNodes = new Map();
 const deckRevisions = new Map();
+const discoveryRows = new Map();
 const emptyState = $('decks').querySelector('.empty-state').cloneNode(true);
 let snapshot;
 let runtime;
@@ -13,10 +14,17 @@ let reconnect;
 let disposed = false;
 let connectionDirty = false;
 let oscDirty = false;
+let notificationsDirty = false;
 let connectionBusy = false;
 let oscBusy = false;
+let notificationsBusy = false;
+let discoveryBusy = false;
 let connectionRequestError = '';
 let connectionRuntimeError = '';
+let notificationsRequestError = '';
+let notificationsRuntimeError = '';
+let discoveryRequestError = '';
+let discoveryRuntimeError = '';
 let runtimeRequest;
 let runtimeVersion = 0;
 let lastRuntimeRefresh = -Infinity;
@@ -71,6 +79,62 @@ function reconcileChildren(parent, nodes) {
     else parent.insertBefore(node,cursor);
   }
 }
+function discoveryAge(ageMs) {
+  if (typeof ageMs !== 'number' || !Number.isFinite(ageMs) || ageMs < 0) return '未確認';
+  if (ageMs < 1000) return 'たった今';
+  if (ageMs < 60000) return Math.floor(ageMs / 1000) + '秒前';
+  if (ageMs < 3600000) return Math.floor(ageMs / 60000) + '分前';
+  return Math.floor(ageMs / 3600000) + '時間前';
+}
+function renderDiscoveryDevices(devices, emptyMessage) {
+  const nodes = devices.map(device => {
+    let row = discoveryRows.get(device.id);
+    if (!row) {
+      row = text('article','discovery-device');
+      const heading = text('div','discovery-device-heading');
+      heading.append(text('strong','discovery-device-model'),text('span','discovery-device-state'));
+      row.append(heading,text('p','discovery-device-address'),text('p','discovery-device-last-seen'),text('p','discovery-device-reason'));
+      discoveryRows.set(device.id,row);
+    }
+    setText(row.querySelector('.discovery-device-model'),device.model);
+    setText(row.querySelector('.discovery-device-address'),device.address + ' · 通信番号 ' + (device.number ?? '—'));
+    const state = row.querySelector('.discovery-device-state');
+    setText(state,device.stateLabel);
+    if (state.dataset.state !== device.state) state.dataset.state = device.state;
+    setText(row.querySelector('.discovery-device-last-seen'),'最終検出 ' + discoveryAge(device.ageMs) + ' · ' + device.interfaceLabel);
+    const reason = row.querySelector('.discovery-device-reason'); setText(reason,device.reason ?? ''); if (reason.hidden !== !device.reason) reason.hidden = !device.reason;
+    return row;
+  });
+  const container = $('discovery-devices');
+  if (!nodes.length) {
+    let empty = container.querySelector('.discovery-empty');
+    if (!empty) { empty = text('p','discovery-empty'); reconcileChildren(container,[empty]); }
+    setText(empty,emptyMessage);
+  } else reconcileChildren(container,nodes);
+  for (const key of discoveryRows.keys()) if (!devices.some(device => device.id === key)) discoveryRows.delete(key);
+}
+function renderDiscovery() {
+  const discovery = runtime?.discovery;
+  const devices = [...(discovery?.devices ?? [])].sort((a,b) => a.sourceIp.localeCompare(b.sourceIp,undefined,{numeric:true}) || a.wireDeviceId - b.wireDeviceId || a.id.localeCompare(b.id));
+  const labels = { announced:'機器通知のみ', receiving:'状態受信中', unassigned:'LAN未確定' };
+  renderDiscoveryDevices(devices.map(device => {
+    const state = device.interfaceId == null ? 'unassigned' : device.status === 'announced' && device.lastStatusAt != null ? 'stale' : device.status;
+    const label = state === 'stale' ? device.lastStatusAt != null ? '状態受信停止' : '通知が途絶' : labels[state] ?? '検出';
+    return { id:device.id, model:device.model, address:device.sourceIp, number:device.wireDeviceId,
+      state, stateLabel:label, ageMs:device.ageMs, reason:device.reason,
+      interfaceLabel:device.interfaceId && device.interfaceEvidence !== 'unknown' ? device.interfaceId + (device.interfaceEvidence === 'capture' ? '（IF確認）' : '（IF推定）') : 'IF未確定' };
+  }),
+  discovery?.searching ? '機器通知を待っています。' : discovery?.attempted ? 'この探索時間内に機器通知を受信できませんでした。' : '探索結果はまだありません。');
+  const scope = discovery?.interfaceName;
+  const source = discovery?.source === 'session' ? '接続中の受信を確認' : '機器通知を受信';
+  setText($('discovery-status'),discovery?.searching ? (scope ? scope + ' · ' : '') + source + '中…' : scope ? scope + ' · 検出 ' + devices.length + '件' : 'LANを選択して機器を探してください。');
+  discoveryRuntimeError = typeof discovery?.error === 'string' ? discovery.error : '';
+  renderDiscoveryError();
+}
+function renderDiscoveryError() {
+  const errors = [...new Set([discoveryRequestError,discoveryRuntimeError].filter(Boolean))];
+  message('discovery-error',errors.join(' / '));
+}
 function scheduleRender() {
   if (disposed || renderTimer !== undefined) return;
   renderTimer = setTimeout(() => {
@@ -100,8 +164,15 @@ settingsDialog.addEventListener('click',event => {
   if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) settingsDialog.close();
 });
 function renderConnectionError() {
-  const errors = [...new Set([connectionRequestError,connectionRuntimeError].filter(Boolean))];
+  const errors = [...new Set([connectionRequestError,connectionRuntimeError,connectionChoiceError()].filter(Boolean))];
   message('connection-error',errors.join(' / '));
+}
+function connectionChoiceError() {
+  return $('method-select').value === 'az-standalone' && !['auto','xdj-az'].includes($('device-select').value) ? 'AZスタンドアロン（試験）は、機器を「自動検出」または「XDJ-AZ」にしてください。' : '';
+}
+function renderNotificationsError() {
+  const errors = [...new Set([notificationsRequestError,notificationsRuntimeError].filter(Boolean))];
+  message('notifications-error',errors.join(' / '));
 }
 async function requestJson(url, body) {
   const response = await fetch(url, body === undefined ? { cache:'no-store' } : { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(body) });
@@ -110,6 +181,7 @@ async function requestJson(url, body) {
   return result;
 }
 function selectedMethod(connection) {
+  if (connection.mode === 'az-standalone') return 'az-standalone';
   return connection.mode === 'passive' ? connection.backend === 'alphatheta' ? 'pcap' : 'passive' : 'virtual-device';
 }
 function updateInterfaces(interfaces, selected) {
@@ -183,6 +255,10 @@ function applyRuntime(next) {
       if ($(id).value !== String(setting)) $(id).value = String(setting);
     }
   }
+  notificationsRuntimeError = typeof runtime.notifications?.error === 'string' ? runtime.notifications.error : '';
+  renderNotificationsError();
+  if (!notificationsDirty && runtime.notifications && $('notifications-enabled').checked !== runtime.notifications.enabled) $('notifications-enabled').checked = runtime.notifications.enabled;
+  renderDiscovery();
   updateControls();
 }
 function updateControls() {
@@ -192,7 +268,7 @@ function updateControls() {
   const validInterface = Boolean(runtime?.interfaces?.some(iface => iface.name === selected));
   const connecting = Boolean(connection.connecting);
   for (const id of ['device-select','interface-select','method-select']) if ($(id).disabled !== (!configured || connectionBusy)) $(id).disabled = !configured || connectionBusy;
-  const connectDisabled = !configured || connectionBusy || connecting || !validInterface;
+  const connectDisabled = !configured || connectionBusy || connecting || !validInterface || Boolean(connectionChoiceError());
   if ($('connect-button').disabled !== connectDisabled) $('connect-button').disabled = connectDisabled;
   setText($('connect-button'),connectionBusy || connecting ? '接続中…' : connection.connected ? '接続し直す' : '接続');
   const disconnectDisabled = !configured || connectionBusy || !(connection.connected || connecting);
@@ -202,7 +278,17 @@ function updateControls() {
   setText($('connection-status'),configured ? status : '設定を読み込み中');
   $('connection-status').classList.toggle('active',Boolean(connection.connected || connecting));
   const method = $('method-select').value;
-  setText($('connection-hint'),connectionDirty ? '変更は「接続」を押すと反映されます。' : connection.mode === 'demo' ? '接続するとデモから実機の受信に切り替わります。' : method === 'pcap' ? '既に流れている通信をpcapで受信します。' : method === 'passive' ? '機器への参加通知を送らず、届く状態を受信します。' : '接続先のネットワークへ参加して状態を受信します。');
+  setText($('connection-hint'),method === 'az-standalone' ? '本体PRO DJ LINK ModeはOFFのまま。PC型参加を試します。実機未検証。' : connectionDirty ? '変更は「接続」を押すと反映されます。' : connection.mode === 'demo' ? '接続するとデモから実機の受信に切り替わります。' : method === 'pcap' ? '既に流れている通信をpcapで受信します。' : method === 'passive' ? '機器への参加通知を送らず、届く状態を受信します。' : '接続先のネットワークへ参加して状態を受信します。');
+  renderConnectionError();
+  const discoveryDisabled = !runtime?.discovery || !validInterface || discoveryBusy || runtime.discovery.searching || connectionBusy || oscBusy || notificationsBusy;
+  if ($('discovery-button').disabled !== discoveryDisabled) $('discovery-button').disabled = discoveryDisabled;
+  setText($('discovery-button'),discoveryBusy || runtime?.discovery?.searching ? '探索中…' : '機器を探す');
+  const expectedModel = { 'xdj-rx3':'XDJ-RX3', 'xdj-az':'XDJ-AZ' }[$('device-select').value];
+  const differentModel = expectedModel && runtime?.discovery?.devices?.some(device => /^(CDJ|XDJ)/.test(device.model) && device.model !== expectedModel);
+  message('discovery-profile-hint',differentModel ? '異なる機種を検出しました。機種の選択は「自動検出」を推奨します。' : '');
+  const emptyDiscovery = runtime?.discovery?.attempted && !runtime.discovery.searching && !runtime.discovery.error && runtime.discovery.devices.length === 0;
+  message('discovery-help',emptyDiscovery ? method === 'az-standalone' ? 'PCのIP/サブネット、WindowsではNode.jsの受信許可を確認してください。' : 'AZのPRO DJ LINK設定、PCのIP/サブネット、WindowsではNode.jsの受信許可を確認してください。' : '');
+  message('discovery-az-note',emptyDiscovery && method !== 'az-standalone' && $('device-select').value === 'xdj-az' ? 'AZでPRO DJ LINKを有効にすると、本体のDeck 3/4は使えません。' : '');
   for (const id of ['osc-enabled','osc-host','osc-port','osc-rate','osc-snapshot']) if ($(id).disabled !== (!configured || oscBusy)) $(id).disabled = !configured || oscBusy;
   const oscDisabled = !configured || oscBusy || !oscDirty;
   if ($('osc-apply').disabled !== oscDisabled) $('osc-apply').disabled = oscDisabled;
@@ -210,9 +296,18 @@ function updateControls() {
   if ($('osc-unsaved').hidden !== !oscDirty) $('osc-unsaved').hidden = !oscDirty;
   setText($('osc-status'),!runtime?.osc ? '設定を読み込み中' : runtime.osc.enabled ? runtime.osc.host + ':' + runtime.osc.port + ' · ' + runtime.osc.maxHz + ' Hz' : '停止中');
   $('osc-status').classList.toggle('active',Boolean(runtime?.osc?.enabled));
+  const notifications = runtime?.notifications;
+  const notificationsDisabled = !notifications || !notifications.supported || notificationsBusy;
+  if ($('notifications-enabled').disabled !== notificationsDisabled) $('notifications-enabled').disabled = notificationsDisabled;
+  if ($('notifications-apply').disabled !== (notificationsDisabled || !notificationsDirty)) $('notifications-apply').disabled = notificationsDisabled || !notificationsDirty;
+  setText($('notifications-apply'),notificationsBusy ? '適用中…' : '適用');
+  if ($('notifications-unsaved').hidden !== !notificationsDirty) $('notifications-unsaved').hidden = !notificationsDirty;
+  setText($('notifications-status'),!notifications ? '設定を読み込み中' : !notifications.supported ? '未対応のOS' : notifications.error ? 'エラー' : notifications.enabled ? 'ON' : 'OFF');
+  $('notifications-status').classList.toggle('active',Boolean(notifications?.supported && notifications.enabled && !notifications.error));
+  setText($('notifications-hint'),notifications && !notifications.supported ? 'このOSでは通知を利用できません。' : 'OSの通知設定によりバナーの表示が制御されます。');
 }
 async function refreshRuntime() {
-  if (disposed || runtimeRequest || connectionBusy || oscBusy) return runtimeRequest;
+  if (disposed || runtimeRequest || connectionBusy || oscBusy || notificationsBusy || discoveryBusy) return runtimeRequest;
   const version = runtimeVersion;
   lastRuntimeRefresh = performance.now();
   runtimeRequest = (async () => {
@@ -230,11 +325,21 @@ $('connection-form').addEventListener('input', () => { connectionDirty = true; u
 $('connection-form').addEventListener('change', () => { connectionDirty = true; updateControls(); });
 $('osc-form').addEventListener('input', () => { oscDirty = true; updateControls(); });
 $('osc-form').addEventListener('change', () => { oscDirty = true; updateControls(); });
+$('notifications-form').addEventListener('input', () => { notificationsDirty = true; updateControls(); });
+$('notifications-form').addEventListener('change', () => { notificationsDirty = true; updateControls(); });
+$('discovery-button').addEventListener('click', async () => {
+  if ($('discovery-button').disabled) return;
+  const payload = { interfaceName:$('interface-select').value };
+  discoveryBusy = true; runtimeVersion++; discoveryRequestError = ''; discoveryRuntimeError = ''; renderDiscoveryError(); updateControls();
+  try { applyRuntime(await requestJson('/api/discovery',payload)); }
+  catch (error) { discoveryRequestError = error.message; renderDiscoveryError(); }
+  finally { discoveryBusy = false; updateControls(); }
+});
 $('connection-form').addEventListener('submit', async event => {
   event.preventDefault();
   if ($('connect-button').disabled || !$('connection-form').reportValidity()) return;
   const method = $('method-select').value;
-  const payload = { action:'connect', profile:$('device-select').value, interfaceName:$('interface-select').value, mode:method === 'virtual-device' ? 'virtual-device' : 'passive', backend:method === 'pcap' ? 'alphatheta' : 'native' };
+  const payload = { action:'connect', profile:$('device-select').value, interfaceName:$('interface-select').value, mode:['virtual-device','az-standalone'].includes(method) ? method : 'passive', backend:method === 'pcap' ? 'alphatheta' : 'native' };
   connectionBusy = true; runtimeVersion++; connectionRequestError = ''; connectionRuntimeError = ''; renderConnectionError(); updateControls();
   try { const next = await requestJson('/api/connection',payload); connectionDirty = false; applyRuntime(next); }
   catch (error) { connectionRequestError = error.message; renderConnectionError(); }
@@ -255,6 +360,15 @@ $('osc-form').addEventListener('submit', async event => {
   try { const next = await requestJson('/api/osc',payload); oscDirty = false; applyRuntime(next); }
   catch (error) { message('osc-error',error.message); }
   finally { oscBusy = false; updateControls(); }
+});
+$('notifications-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if ($('notifications-apply').disabled) return;
+  const payload = { enabled:$('notifications-enabled').checked };
+  notificationsBusy = true; runtimeVersion++; notificationsRequestError = ''; notificationsRuntimeError = ''; renderNotificationsError(); updateControls();
+  try { const next = await requestJson('/api/notifications',payload); notificationsDirty = false; applyRuntime(next); }
+  catch (error) { notificationsRequestError = error.message; renderNotificationsError(); }
+  finally { notificationsBusy = false; updateControls(); }
 });
 
 function makeDeck(deck) {
@@ -370,7 +484,7 @@ function connectSocket() {
       else if (incoming.type === 'delta') {
         if (!snapshot || incoming.baseRevision !== snapshot.revision) { socket.send(JSON.stringify({ type:'resync' })); return; }
         const decks = new Map(snapshot.decks.map(deck => [deck.deckId,deck])); for (const id of incoming.removedDeckIds ?? []) decks.delete(id); for (const deck of incoming.decks ?? []) decks.set(deck.deckId,deck);
-        snapshot = { ...snapshot,revision:incoming.revision,session:incoming.session,diagnostics:incoming.diagnostics,decks:[...decks.values()] };
+        snapshot = { ...snapshot,revision:incoming.revision,session:incoming.session,representative:incoming.representative ?? snapshot.representative,diagnostics:incoming.diagnostics,devices:incoming.devices ?? snapshot.devices,decks:[...decks.values()] };
       } else return;
       // Capture nonempty messages before frame coalescing: a following status
       // packet may already clear reason before the scheduled render runs.
@@ -380,7 +494,7 @@ function connectSocket() {
   });
   socket.addEventListener('close',() => {
     $('socket-dot').className = 'dot error'; $('socket-status').textContent = '画面の再接続を待機';
-    if (snapshot) { snapshot.session = { ...snapshot.session,state:'disconnected',reason:'画面との接続が途絶えています。' }; for (const deck of snapshot.decks) { for (const field of Object.values(deck)) if (field && typeof field === 'object' && 'freshness' in field) field.freshness = 'stale'; } deckRevisions.clear(); scheduleRender(); }
+    if (snapshot) { snapshot.session = { ...snapshot.session,state:'disconnected',reason:'画面との接続が途絶えています。' }; snapshot.representative = { deckId:null,publicDeckId:null,reason:'none' }; for (const deck of snapshot.decks) { for (const field of Object.values(deck)) if (field && typeof field === 'object' && 'freshness' in field) field.freshness = 'stale'; } deckRevisions.clear(); scheduleRender(); }
     if (!disposed) reconnect = setTimeout(connectSocket,1500);
   });
   socket.addEventListener('error',() => socket.close());

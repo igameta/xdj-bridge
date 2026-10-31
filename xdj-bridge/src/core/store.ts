@@ -1,9 +1,10 @@
-import { decodePacket, resolveProfile } from './decoder.js';
-import type { Capability, DeckState, Diagnostic, Field, PacketEnvelope, PlaybackState, Profile, SessionState, Snapshot, StatusObservation, TrackRef } from './types.js';
+import { decodePacket, resolveProfile, tempoMasterFromFlags } from './decoder.js';
+import { selectRepresentative } from './representative.js';
+import type { Capability, DeckState, DeviceObservation, Diagnostic, Field, PacketEnvelope, PlaybackState, Profile, SessionState, Snapshot, StatusObservation, TrackRef } from './types.js';
 
 const empty = <T>(source = 'unavailable'): Field<T> => ({ value: null, quality: 'unknown', source, observedAt: null, freshness: 'fresh' });
 const observed = <T>(value: T | null | undefined, at: number, source: string): Field<T> => value == null ? empty<T>(source) : ({ value, quality: 'observed', source, observedAt: at, freshness: 'fresh' });
-const fieldNames = ['title', 'artist', 'playbackState', 'trackBpm', 'effectiveBpm', 'pitchPercent', 'beat', 'beatPhase', 'positionMs', 'onAir'] as const;
+const fieldNames = ['title', 'artist', 'playbackState', 'tempoMaster', 'trackBpm', 'effectiveBpm', 'pitchPercent', 'beat', 'beatPhase', 'positionMs', 'onAir'] as const;
 const trackKey = (t: TrackRef | null) => t ? JSON.stringify(t) : '';
 const finite = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n);
 
@@ -30,7 +31,7 @@ export class StateStore {
     this.options = options;
     this.staleAfterMs = options.staleAfterMs ?? 3000;
     if (!Number.isFinite(this.staleAfterMs) || this.staleAfterMs <= 0) throw new Error('staleAfterMs must be positive');
-    this.state = { schemaVersion: 1, revision: 0, session: { id: options.sessionId, mode: options.mode, state: 'disconnected', interfaceId: options.interfaceId ?? null, reason: null, now: 0 }, decks: [], diagnostics: [] };
+    this.state = { schemaVersion: 1, revision: 0, session: { id: options.sessionId, mode: options.mode, state: 'disconnected', interfaceId: options.interfaceId ?? null, reason: null, now: 0 }, decks: [], devices: [], representative: { deckId: null, publicDeckId: null, reason: 'none' }, diagnostics: [] };
     this.diagnostic('media-observation-limit', 'info', 'Media removal cannot always be observed; metadata is invalidated after a receive gap or reconnect.', 0);
     if (options.mode === 'demo') this.diagnostic('synthetic-demo', 'warning', 'DEMO: all packets are synthetic and do not verify hardware support.', 0);
   }
@@ -45,6 +46,7 @@ export class StateStore {
     return () => { this.listeners.delete(listener); };
   }
   private publish(): void {
+    this.state.representative = selectRepresentative(this.state, this.state.representative.deckId);
     this.state.revision++;
     for (const listener of this.listeners) listener(this.snapshot());
   }
@@ -56,6 +58,32 @@ export class StateStore {
   addDiagnostic(code: string, level: Diagnostic['level'], message: string, now = this.state.session.now): void {
     this.diagnostic(code, level, message, now);
     this.publish();
+  }
+  /** Bounded observation catalog, separate from deck values and providers. */
+  observeDevice(observation: DeviceObservation): void {
+    this.recordDevice(observation); this.publish();
+  }
+  private recordDevice(o: DeviceObservation): void {
+    if (!finite(o.receivedAt) || o.receivedAt < 0 || !o.model || !/^[\x20-\x7e]{1,20}$/.test(o.model) || !Number.isInteger(o.wireDeviceId) || o.wireDeviceId < 1 || o.wireDeviceId > 255) return;
+    const id = `${this.state.session.id}/${o.interfaceId ?? 'unknown'}/${o.sourceIp}/wire-${o.wireDeviceId}`;
+    let device = this.state.devices.find(value => value.id === id);
+    if (device && o.receivedAt < device.lastSeenAt) return;
+    if (!device) {
+      device = { id, model: o.model, sourceIp: o.sourceIp, wireDeviceId: o.wireDeviceId, interfaceId: o.interfaceId, interfaceEvidence: o.interfaceEvidence, advertisedIp: o.advertisedIp ?? null, mac: o.mac ?? null,
+        lastSeenAt: o.receivedAt, lastStatusAt: null, status: o.interfaceId == null ? 'unassigned' : 'announced', reason: o.reason ?? null };
+      this.state.devices.push(device);
+      if (this.state.devices.length > 128) {
+        const oldest = [...this.state.devices].sort((a, b) => a.lastSeenAt - b.lastSeenAt)[0];
+        this.state.devices.splice(this.state.devices.indexOf(oldest), 1);
+      }
+    }
+    device.model = o.model; device.lastSeenAt = o.receivedAt;
+    device.interfaceEvidence = o.interfaceEvidence;
+    device.advertisedIp = o.advertisedIp ?? device.advertisedIp; device.mac = o.mac ?? device.mac;
+    if (o.hasStatus) device.lastStatusAt = o.receivedAt;
+    device.status = o.interfaceId == null ? 'unassigned' : device.lastStatusAt != null && o.receivedAt - device.lastStatusAt <= this.staleAfterMs ? 'receiving' : 'announced';
+    device.reason = o.reason ?? (device.status === 'announced' ? device.lastStatusAt == null ? '機器通知を受信しました。再生情報の受信はまだ確認できていません。' : '機器通知は継続していますが、再生情報の受信が途絶えています。' : null);
+    this.state.session.now = Math.max(this.state.session.now, o.receivedAt);
   }
   setSession(update: Partial<SessionState>): void {
     const was = this.state.session.state;
@@ -76,6 +104,7 @@ export class StateStore {
         d.stateRevision++;
       }
     }
+    if (update.state === 'disconnected') for (const device of this.state.devices) device.status = 'stale';
     if (update.state === 'disconnected' && was !== 'disconnected') {
       const media = new Map<string, { source: string; slot: number }>();
       for (const d of this.state.decks) if (d.trackRef) media.set(`${d.trackRef.sourceDeviceId}:${d.trackRef.protocolSlot}`, { source: d.trackRef.sourceDeviceId, slot: d.trackRef.protocolSlot });
@@ -91,6 +120,8 @@ export class StateStore {
     this.state.session.now = Math.max(this.state.session.now, now);
     if (event.kind === 'status') { this.ingestStatus(event.status); return; }
     if (event.kind === 'announcement') {
+      this.recordDevice({ model: event.model, sourceIp: envelope.sourceIp, wireDeviceId: event.wireDeviceId, interfaceId: envelope.interfaceId,
+        interfaceEvidence: envelope.interfaceEvidence ?? (envelope.transport === 'pcap' || envelope.transport === 'replay' ? 'capture' : 'subnet'), advertisedIp: event.advertisedIp, mac: event.mac, receivedAt: now });
       const physical = this.physicalId(envelope.interfaceId, envelope.sourceIp, event.model);
       this.registerOwner(envelope.interfaceId, event.wireDeviceId, physical, now);
       if (this.state.session.state === 'disconnected') this.state.session.state = 'observing';
@@ -189,6 +220,8 @@ export class StateStore {
     let d = this.state.decks.find(d => d.deckId === deckId);
     const previousAt = this.lastStatus.get(deckId);
     if (previousAt !== undefined && now < previousAt) return;
+    this.recordDevice({ model: s.model, sourceIp: s.sourceIp, wireDeviceId: s.wireDeviceId, interfaceId: s.interfaceId,
+      interfaceEvidence: s.source?.startsWith('pcap:') || s.source?.startsWith('replay:') ? 'capture' : 'subnet', receivedAt: now, hasStatus: true });
     this.registerOwner(s.interfaceId, s.wireDeviceId, physical, now);
     if (!d) {
       let publicDeckId = this.options.publicDeckIds?.[deckId] ?? this.options.publicDeckIds?.[`${s.sourceIp}:${s.wireDeviceId}`] ?? (logicalDeck == null ? null : String(logicalDeck));
@@ -196,7 +229,7 @@ export class StateStore {
         this.diagnostic('public-deck-collision', 'warning', `Public deck ${publicDeckId} is already assigned; configure an explicit unique mapping.`, now, deckId);
         publicDeckId = null;
       }
-      d = { schemaVersion: 1, sessionId: this.state.session.id, deckId, physicalDeviceId: physical, publicDeckId, logicalDeck, wireDeviceId: s.wireDeviceId, model: s.model, profile, stateRevision: 0, loadGeneration: 0, trackRef: null, title: empty(), artist: empty(), playbackState: empty(), trackBpm: empty(), effectiveBpm: empty(), pitchPercent: empty(), beat: empty(), beatPhase: empty(), positionMs: empty(), onAir: empty(), capabilities: {}, raw: {} };
+      d = { schemaVersion: 1, sessionId: this.state.session.id, deckId, physicalDeviceId: physical, publicDeckId, logicalDeck, wireDeviceId: s.wireDeviceId, model: s.model, profile, stateRevision: 0, loadGeneration: 0, trackRef: null, title: empty(), artist: empty(), playbackState: empty(), tempoMaster: empty(), trackBpm: empty(), effectiveBpm: empty(), pitchPercent: empty(), beat: empty(), beatPhase: empty(), positionMs: empty(), onAir: empty(), capabilities: {}, raw: {} };
       this.state.decks.push(d);
       this.diagnostic('profile-resolved', resolved.forced ? 'warning' : 'info', resolved.reason + (resolved.forced ? '; forced trial remains unverified.' : ''), now, deckId);
       if (logicalDeck == null) this.diagnostic('unmapped-deck', 'warning', `Wire device ${s.wireDeviceId} has no confirmed logical deck mapping.`, now, deckId);
@@ -222,6 +255,8 @@ export class StateStore {
     const pitch = finite(s.pitchPercent) && s.pitchPercent >= -100 && s.pitchPercent <= 100 ? s.pitchPercent : null;
     const playback = this.playback(s, profile);
     d.playbackState = observed(playback, now, profile === 'xdj-rx3' ? `${source}:rx3-playState` : `${source}:playState`);
+    const tempoMaster = typeof s.tempoMaster === 'boolean' ? s.tempoMaster : tempoMasterFromFlags(s.statusFlags);
+    d.tempoMaster = observed(tempoMaster, now, typeof s.tempoMaster === 'boolean' ? `${source}:tempo-master` : `${source}:status-flags-master`);
     d.trackBpm = observed(bpm, now, source);
     d.pitchPercent = observed(pitch, now, source);
     d.effectiveBpm = observed(bpm != null && pitch != null ? bpm * (1 + pitch / 100) : null, now, `${source}:effective-pitch`);
@@ -236,13 +271,14 @@ export class StateStore {
     d.capabilities.status = this.capability(verification, 'available', profile === 'xdj-rx3' ? 'RX3 packet interpretation matches saved captures; live firmware support requires hardware verification.' : 'Generic decoder; this model/firmware requires hardware verification.', now, source);
     d.capabilities.bpm = this.capability(verification, bpm == null ? 'unavailable' : 'available', bpm == null ? 'No valid track BPM.' : 'Track BPM and effective pitch are separate observations.', now, source);
     d.capabilities.playback = this.capability(verification, playback == null ? 'unavailable' : 'available', playback == null ? `Unknown playState ${s.playState}.` : 'Decoded playState.', now, source);
+    d.capabilities.tempoMaster = this.capability('implemented-unverified', tempoMaster == null ? 'unavailable' : 'available', 'Tempo-master observation follows status flag 0x20 or the public status API; model/firmware behavior needs hardware verification.', now, d.tempoMaster.source);
     const hasBeat = d.beat.value != null || (d.beatPhase.value != null && d.beatPhase.freshness === 'fresh' && d.beatPhase.observedAt != null && now - d.beatPhase.observedAt <= this.staleAfterMs);
     d.capabilities.beat = this.capability('implemented-unverified', hasBeat ? 'available' : 'unavailable', 'Beat counter and fresh notifications are checked independently of BPM.', now, source);
     d.capabilities.position ??= this.capability('implemented-unverified', 'unavailable', 'No absolute position observed; BPM is not a track-position source.', now, source);
     d.capabilities.metadata ??= this.capability('implemented-unverified', 'idle', 'Metadata provider has not succeeded.', now, 'metadata-provider');
     d.capabilities.analysis ??= this.capability('implemented-unverified', 'idle', 'Analysis provider has not succeeded.', now, 'analysis-provider');
     d.capabilities.onAir = this.capability('unknown', 'unavailable', 'Mixer/model-specific audible-state semantics have not been verified.', now, source);
-    d.raw = { ...s.raw, sourceIp: s.sourceIp, interfaceId: s.interfaceId, playState: s.playState, statusFlags: s.statusFlags ?? null, playingFlag: s.statusFlags == null ? null : Boolean(s.statusFlags & 0x40), beatInMeasure: s.beatInMeasure ?? null, firmware: null };
+    d.raw = { ...s.raw, sourceIp: s.sourceIp, interfaceId: s.interfaceId, playState: s.playState, statusFlags: s.statusFlags ?? null, playingFlag: s.statusFlags == null ? null : Boolean(s.statusFlags & 0x40), tempoMasterFlag: tempoMaster, beatInMeasure: s.beatInMeasure ?? null, firmware: null };
     d.stateRevision++;
     this.state.session.now = Math.max(this.state.session.now, now);
     this.state.session.state = this.state.decks.some(other => other.deckId !== deckId && other.playbackState.freshness === 'stale') ? 'degraded' : 'online';
@@ -254,6 +290,15 @@ export class StateStore {
     if (!finite(now) || now < this.state.session.now) return;
     this.state.session.now = now;
     let changed = false;
+    for (const device of this.state.devices) {
+      const status = now - device.lastSeenAt > 6000 ? 'stale' : device.interfaceId == null ? 'unassigned' : device.lastStatusAt != null && now - device.lastStatusAt <= this.staleAfterMs ? 'receiving' : 'announced';
+      if (device.status !== status) {
+        device.status = status;
+        if (status === 'announced') device.reason = device.lastStatusAt == null ? '機器通知を受信しました。再生情報の受信はまだ確認できていません。' : '機器通知は継続していますが、再生情報の受信が途絶えています。';
+        else if (status === 'stale' && device.interfaceId != null) device.reason = 'この機器からの通知を一定時間受信していません。';
+        changed = true;
+      }
+    }
     let freshDecks = 0;
     for (const d of this.state.decks) {
       const silent = now - (this.lastStatus.get(d.deckId) ?? 0) > this.staleAfterMs;
@@ -269,7 +314,7 @@ export class StateStore {
       }
       const usable = (field: Field<unknown>) => field.value != null && field.quality !== 'unknown' && field.freshness === 'fresh';
       const available: Record<string, boolean> = {
-        bpm: usable(d.trackBpm), playback: usable(d.playbackState),
+        bpm: usable(d.trackBpm), playback: usable(d.playbackState), tempoMaster: usable(d.tempoMaster),
         beat: usable(d.beat) || usable(d.beatPhase), position: usable(d.positionMs),
         metadata: usable(d.title) || usable(d.artist),
       };

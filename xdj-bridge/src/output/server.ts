@@ -9,6 +9,8 @@ export interface RuntimeControls {
   connect(input: unknown): Promise<void>;
   disconnect(): Promise<void>;
   setOsc(input: unknown): Promise<void>;
+  setNotifications?(input: unknown): Promise<void>;
+  discover?(input: unknown): Promise<void>;
 }
 export interface ServerOptions {
   host?: string; port?: number; publicDir?: string;
@@ -58,10 +60,18 @@ export async function startServer(store: StateSource, options: ServerOptions = {
     if (!validRequest(req)) { res.writeHead(403).end('Forbidden origin or host'); return; }
     try {
       const path = new URL(req.url ?? '/', 'http://' + authority).pathname;
-      if (req.method === 'POST' && (path === '/api/connection' || path === '/api/osc') && options.controls) {
+      if (req.method === 'POST' && (path === '/api/connection' || path === '/api/osc' || path === '/api/notifications' || path === '/api/discovery') && options.controls) {
         if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) throw new HttpError('Settings can only be changed from this computer', 403);
         const body = await jsonBody(req);
-        if (path === '/api/osc') await options.controls.setOsc(body);
+        if (path === '/api/discovery') {
+          if (!options.controls.discover) throw new HttpError('Device discovery is unavailable', 501);
+          await options.controls.discover(body);
+        }
+        else if (path === '/api/notifications') {
+          if (!options.controls.setNotifications) throw new HttpError('OS notification settings are unavailable', 501);
+          await options.controls.setNotifications(body);
+        }
+        else if (path === '/api/osc') await options.controls.setOsc(body);
         else {
           const action = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).action : undefined;
           if (action === 'connect') await options.controls.connect(body);
@@ -110,7 +120,8 @@ export async function startServer(store: StateSource, options: ServerOptions = {
     const message = forceSnapshot || state.needsSnapshot || state.sessionId !== snapshot.session.id ? { type: 'snapshot', ...snapshot } : {
       type: 'delta', schemaVersion: snapshot.schemaVersion, baseRevision: state.revision, revision: snapshot.revision,
       decks: snapshot.decks.filter(deck => state.decks.get(deck.deckId) !== deck.stateRevision),
-      removedDeckIds: [...state.decks.keys()].filter(id => !currentDecks.has(id)), session: snapshot.session, diagnostics: snapshot.diagnostics,
+      devices: snapshot.devices,
+      removedDeckIds: [...state.decks.keys()].filter(id => !currentDecks.has(id)), session: snapshot.session, representative: snapshot.representative, diagnostics: snapshot.diagnostics,
     };
     client.send(JSON.stringify(message), error => { if (error) client.terminate(); });
     state.revision = snapshot.revision; state.sessionId = snapshot.session.id; state.decks = currentDecks; state.needsSnapshot = false;
